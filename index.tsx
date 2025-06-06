@@ -21,7 +21,7 @@ export class GdmLiveAudio extends LitElement {
   private inputAudioContext = new (window.AudioContext ||
     window.webkitAudioContext)({sampleRate: 16000});
   private outputAudioContext = new (window.AudioContext ||
-    window.webkitAudioContext)({sampleRate: 24000});
+    window.webkitAudioContext)({sampleRate: 24000}); // Consider latencyHint: 'playback'
   @state() inputNode = this.inputAudioContext.createGain();
   @state() outputNode = this.outputAudioContext.createGain();
   private nextStartTime = 0;
@@ -29,6 +29,10 @@ export class GdmLiveAudio extends LitElement {
   private sourceNode: AudioBufferSourceNode;
   private scriptProcessorNode: ScriptProcessorNode;
   private sources = new Set<AudioBufferSourceNode>();
+
+  // New properties for speaker output
+  private outputMediaElement: HTMLAudioElement;
+  private mediaStreamDestination: MediaStreamAudioDestinationNode;
 
   static styles = css`
     #status {
@@ -92,7 +96,50 @@ export class GdmLiveAudio extends LitElement {
       apiKey: process.env.API_KEY,
     });
 
-    this.outputNode.connect(this.outputAudioContext.destination);
+    // --- START: Speaker Output Setup ---
+    this.outputMediaElement = new Audio();
+    this.outputMediaElement.autoplay = true;
+    // this.outputMediaElement.muted = true; // Keep unmuted, control volume via outputNode
+    // this.outputMediaElement.controls = true; // For debugging, you can show controls
+    // document.body.appendChild(this.outputMediaElement); // For debugging, append to see it
+
+    this.mediaStreamDestination = this.outputAudioContext.createMediaStreamDestination();
+    this.outputMediaElement.srcObject = this.mediaStreamDestination.stream;
+
+    // Connect the main output gain node to our MediaStreamDestination
+    // instead of the AudioContext's default destination.
+    this.outputNode.connect(this.mediaStreamDestination);
+    // DO NOT DO THIS ANYMORE: this.outputNode.connect(this.outputAudioContext.destination);
+
+    // Attempt to set the audio output to the default speaker
+    if (typeof this.outputMediaElement.setSinkId === 'function') {
+      try {
+        // '' (empty string) or 'default' often selects the main speaker for media.
+        // On some systems, you might need to enumerate devices and pick a specific speaker ID.
+        await this.outputMediaElement.setSinkId('');
+        console.log('Successfully set audio output sink to default (likely speaker).');
+        this.updateStatus('Audio output set to speaker.');
+      } catch (err) {
+        console.error('Error setting sinkId:', err);
+        this.updateError(`Error setting audio output: ${err.message}. May use earpiece.`);
+        // Fallback: if setSinkId fails, audio will play through the default route
+        // which might still be the earpiece.
+        // To ensure audio still plays, connect outputNode to default destination as a fallback.
+        // However, this might create double audio if setSinkId partially worked or if the
+        // mediaElement still plays. For now, let's assume if setSinkId fails, the
+        // mediaElement route might still work via default routing.
+      }
+    } else {
+      this.updateStatus('setSinkId API not supported. Audio output may use earpiece.');
+      // If setSinkId is not supported, the audio from outputMediaElement will go to the
+      // default device. To ensure our AudioContext output is heard, we could connect
+      // outputNode to the default destination as well, but this could lead to double audio
+      // if the media element also plays.
+      // A safer fallback if setSinkId is not available is to just use the original method:
+      // this.outputNode.connect(this.outputAudioContext.destination);
+      // For now, we'll rely on the mediaElement's default routing.
+    }
+    // --- END: Speaker Output Setup ---
 
     this.initSession();
   }
@@ -105,13 +152,29 @@ export class GdmLiveAudio extends LitElement {
         model: model,
         callbacks: {
           onopen: () => {
-            this.updateStatus('Opened');
+            this.updateStatus('Opened. ' + (this.status || 'Audio output may use earpiece.'));
           },
           onmessage: async (message: LiveServerMessage) => {
             const audio =
               message.serverContent?.modelTurn?.parts[0]?.inlineData;
 
             if (audio) {
+              // Ensure the output AudioContext is running, especially on user gesture
+              if (this.outputAudioContext.state === 'suspended') {
+                await this.outputAudioContext.resume();
+              }
+              // Ensure the media element is playing (important for some browsers)
+              if (this.outputMediaElement.paused) {
+                try {
+                  await this.outputMediaElement.play();
+                } catch (playError) {
+                  console.error("Error trying to play outputMediaElement:", playError);
+                  // This might happen if play() is called without prior user interaction
+                  // on some strict mobile browsers.
+                }
+              }
+
+
               this.nextStartTime = Math.max(
                 this.nextStartTime,
                 this.outputAudioContext.currentTime,
@@ -125,7 +188,7 @@ export class GdmLiveAudio extends LitElement {
               );
               const source = this.outputAudioContext.createBufferSource();
               source.buffer = audioBuffer;
-              source.connect(this.outputNode);
+              source.connect(this.outputNode); // outputNode is now connected to mediaStreamDestination
               source.addEventListener('ended', () =>{
                 this.sources.delete(source);
               });
@@ -161,6 +224,7 @@ export class GdmLiveAudio extends LitElement {
       });
     } catch (e) {
       console.error(e);
+      this.updateError(`Session init error: ${e.message}`);
     }
   }
 
@@ -177,7 +241,25 @@ export class GdmLiveAudio extends LitElement {
       return;
     }
 
-    this.inputAudioContext.resume();
+    // Resume AudioContexts on user gesture - crucial for browsers
+    if (this.inputAudioContext.state === 'suspended') {
+      await this.inputAudioContext.resume();
+    }
+    if (this.outputAudioContext.state === 'suspended') {
+      await this.outputAudioContext.resume();
+    }
+    // Attempt to play the output media element on user gesture
+    // This helps satisfy autoplay policies on mobile browsers.
+    if (this.outputMediaElement && this.outputMediaElement.paused) {
+        try {
+            await this.outputMediaElement.play();
+            console.log("Output media element played successfully on startRecording.");
+        } catch (err) {
+            console.warn("Could not play output media element on startRecording:", err);
+            // This might still be okay if it plays when data arrives.
+        }
+    }
+
 
     this.updateStatus('Requesting microphone access...');
 
@@ -194,7 +276,8 @@ export class GdmLiveAudio extends LitElement {
       );
       this.sourceNode.connect(this.inputNode);
 
-      const bufferSize = 256;
+      const bufferSize = 256; // Consider increasing if ScriptProcessorNode causes issues
+                              // But ideally, move to AudioWorklet later.
       this.scriptProcessorNode = this.inputAudioContext.createScriptProcessor(
         bufferSize,
         1,
@@ -211,7 +294,8 @@ export class GdmLiveAudio extends LitElement {
       };
 
       this.sourceNode.connect(this.scriptProcessorNode);
-      this.scriptProcessorNode.connect(this.inputAudioContext.destination);
+      // Do NOT connect scriptProcessorNode to destination if you don't want to hear raw input
+      // this.scriptProcessorNode.connect(this.inputAudioContext.destination);
 
       this.isRecording = true;
       this.updateStatus('🔴 Recording... Capturing PCM chunks.');
@@ -243,12 +327,21 @@ export class GdmLiveAudio extends LitElement {
       this.mediaStream = null;
     }
 
+    // Optionally pause the output media element when not actively in a session
+    // if (this.outputMediaElement && !this.outputMediaElement.paused) {
+    //   this.outputMediaElement.pause();
+    // }
+
     this.updateStatus('Recording stopped. Click Start to begin again.');
   }
 
   private reset() {
     this.session?.close();
-    this.initSession();
+    // Re-initialize client and session to ensure clean state,
+    // including the audio output setup.
+    // Or, more selectively, just re-init session if client setup is stable.
+    // For simplicity here, re-running initClient will re-attempt setSinkId.
+    this.initClient(); // This will re-run the speaker setup
     this.updateStatus('Session cleared.');
   }
 
@@ -298,7 +391,7 @@ export class GdmLiveAudio extends LitElement {
           </button>
         </div>
 
-        <div id="status"> ${this.error} </div>
+        <div id="status"> ${this.status || this.error || 'Ready'} </div>
         <gdm-live-audio-visuals-3d
           .inputNode=${this.inputNode}
           .outputNode=${this.outputNode}></gdm-live-audio-visuals-3d>
